@@ -1,0 +1,45 @@
+{
+  "success": true,
+  "data": {
+    "train": {
+      "number": "16630"
+    },
+    "delayMinutes": 23,
+    "currentLocation": null,
+    "route": [
+      {
+        "stationCode": "TRVL",
+        "stationName": "Tiruvalla",
+        "sequence": 30,
+        "status": "upcoming",
+        "provenance": "predicted",
+        "scheduledArrival": "2026-11-12T04:39:00+05:30",
+        "actualArrival": "2026-11-12T05:02:00+05:30",
+        "scheduledDeparture": "2026-11-12T04:40:00+05:30",
+        "actualDeparture": "2026-11-12T05:03:00+05:30"
+      },
+      {
+        "stationCode": "CNGR",
+        "stationName": "Chengannur",
+        "sequence": 31,
+        "status": "upcoming",
+        "provenance": "predicted",
+        "scheduledArrival": "2026-11-12T04:51:00+05:30",
+        "actualArrival": "2026-11-12T05:14:00+05:30",
+        "scheduledDeparture": "2026-11-12T04:53:00+05:30",
+        "actualDeparture": "2026-11-12T05:16:00+05:30"
+      },
+      {
+        "stationCode": "KZK",
+        "stationName": "Kazhakuttam",
+        "sequence": 45,
+        "status": "upcoming",
+        "provenance": "predicted",
+        "scheduledArrival": "2026-11-12T07:05:00+05:30",
+        "actualArrival": "2026-11-12T07:28:00+05:30",
+        "scheduledDeparture": "2026-11-12T07:06:00+05:30",
+        "actualDeparture": "2026-11-12T07:29:00+05:30"
+      }
+    ]
+  }
+}

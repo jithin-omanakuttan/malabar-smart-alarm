@@ -1,0 +1,75 @@
+name: Malabar Smart Alarm
+
+on:
+  schedule:
+    # GitHub supports an IANA `timezone` per schedule entry, so these are IST
+    # times. Three runs give redundancy: scheduled runs can start late or be
+    # dropped when GitHub is busy (worst at the top of the hour). Only the first
+    # successful run sends; later runs detect it and skip (or upgrade a
+    # FALLBACK/SCHEDULED notification to LIVE).
+    #
+    # UTC equivalents if you ever remove `timezone` (IST = UTC+5:30, previous
+    # UTC day, so Mon-Fri IST = Sun-Thu UTC):
+    #   03:47 IST = '17 22 * * 0-4'   03:53 IST = '23 22 * * 0-4'   04:00 IST = '30 22 * * 0-4'
+    - cron: '47 3 * * 1-5'
+      timezone: 'Asia/Kolkata'
+    - cron: '53 3 * * 1-5'
+      timezone: 'Asia/Kolkata'
+    - cron: '0 4 * * 1-5'
+      timezone: 'Asia/Kolkata'
+
+  workflow_dispatch:
+    inputs:
+      skip_dedupe:
+        description: 'Send even if a notification was already sent today'
+        type: boolean
+        default: true
+      dry_run:
+        description: 'Dry run: log the message but do not send it'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: malabar-smart-alarm
+  cancel-in-progress: false
+
+jobs:
+  notify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Check out code
+        uses: actions/checkout@v5
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+
+      - name: Check train and notify
+        env:
+          # Secrets (Settings > Secrets and variables > Actions > Secrets)
+          RAILRADAR_API_KEY: ${{ secrets.RAILRADAR_API_KEY }}
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          NTFY_TOKEN: ${{ secrets.NTFY_TOKEN }}
+          # Optional overrides (Settings > Secrets and variables > Actions > Variables).
+          # Unset variables are empty and the defaults in src/config.py apply.
+          TRAIN_NAME: ${{ vars.TRAIN_NAME }}
+          TRAIN_NUMBER: ${{ vars.TRAIN_NUMBER }}
+          BOARDING_STATION_NAME: ${{ vars.BOARDING_STATION_NAME }}
+          BOARDING_STATION_CODE: ${{ vars.BOARDING_STATION_CODE }}
+          BUFFER_MINUTES: ${{ vars.BUFFER_MINUTES }}
+          FALLBACK_SCHEDULED_ARRIVAL: ${{ vars.FALLBACK_SCHEDULED_ARRIVAL }}
+          MONITORING_DAYS: ${{ vars.MONITORING_DAYS }}
+          NTFY_SERVER: ${{ vars.NTFY_SERVER }}
+          NTFY_PRIORITY: ${{ vars.NTFY_PRIORITY }}
+          # Manual runs ignore the weekday check.
+          FORCE_RUN: ${{ github.event_name == 'workflow_dispatch' }}
+          SKIP_DEDUPE: ${{ github.event_name == 'workflow_dispatch' && inputs.skip_dedupe }}
+          DRY_RUN: ${{ github.event_name == 'workflow_dispatch' && inputs.dry_run }}
+        run: python -m src.main
