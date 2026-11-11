@@ -15,10 +15,15 @@ Buffer: 40 minutes
 Delay: 23 minutes
 Status: LIVE
 Source: RailRadar (predicted)
-Ref: 16630/2026-11-12/LIVE
 ```
 
-It costs nothing to run. It uses GitHub Actions (free tier), Python (no extra packages), the RailRadar API and ntfy.sh (free tier).
+It runs entirely on the **Supabase Free plan**, which needs no payment card:
+
+- a **Supabase Edge Function** (TypeScript/Deno) does the work
+- **Supabase Cron** (pg_cron + pg_net) runs it on a schedule
+- a small **Postgres table** keeps a log of runs and prevents duplicate notifications
+
+It also uses the RailRadar API and **ntfy.sh** (free).
 
 > **Important:** This sends a **notification**. It does **not** create or change alarms in the
 > iPhone Clock app. Configure ntfy as described below so the notification can wake you.
@@ -28,21 +33,23 @@ It costs nothing to run. It uses GitHub Actions (free tier), Python (no extra pa
 ## Contents
 
 1. [How it works](#how-it-works)
-2. [What LIVE / SCHEDULED / FALLBACK mean](#status-meanings)
-3. [Deployment checklist](#deployment-checklist)
-4. [Step 1 - Create a private GitHub repository](#step-1)
-5. [Step 2 - Upload the project](#step-2)
-6. [Step 3 - Create your ntfy topic](#step-3)
-7. [Step 4 - Install ntfy on iPhone and allow notifications](#step-4)
-8. [Step 5 - Configure GitHub Actions Secrets](#step-5)
-9. [Step 6 - Run the workflow manually](#step-6)
-10. [Step 7 - Verify the notification](#step-7)
-11. [Scheduling and why runs can be late](#scheduling)
-12. [Changing train, station, buffer and schedule](#changing)
-13. [Troubleshooting](#troubleshooting)
-14. [Security and rotating credentials](#security)
-15. [Running tests locally](#tests)
-16. [Project structure](#structure)
+2. [What LIVE / SCHEDULED / FALLBACK mean](#status)
+3. [Deployment checklist](#checklist)
+4. [Step 1 - Create a Supabase project](#step-1)
+5. [Step 2 - Link this folder to the project](#step-2)
+6. [Step 3 - Create the database table and schedule](#step-3)
+7. [Step 4 - Set the function secrets](#step-4)
+8. [Step 5 - Deploy the Edge Function](#step-5)
+9. [Step 6 - Give the schedule its Vault secrets](#step-6)
+10. [Step 7 - Test manually](#step-7)
+11. [ntfy and iPhone setup](#ntfy)
+12. [Scheduling, timezones and delays](#scheduling)
+13. [Free plan: keeping the project awake](#pausing)
+14. [Changing train, station, buffer and schedule](#changing)
+15. [Troubleshooting](#troubleshooting)
+16. [Security and rotating credentials](#security)
+17. [Running tests locally](#tests)
+18. [Project structure](#structure)
 
 ---
 
@@ -51,303 +58,336 @@ It costs nothing to run. It uses GitHub Actions (free tier), Python (no extra pa
 
 ```mermaid
 flowchart TD
-    subgraph GH["GitHub Actions (free, private repo)"]
-        CRON["Schedule: 03:47, 03:53, 04:00 IST<br/>Mon-Fri (timezone: Asia/Kolkata)"]
-        MANUAL["Manual run<br/>(workflow_dispatch)"]
-        MAIN["src/main.py"]
-        CFG["config.py<br/>defaults + Secrets/Variables"]
-        CLIENT["railradar_client.py<br/>HTTPS, timeout, retry"]
-        SVC["train_service.py<br/>validate JSON, find CNGR"]
-        CALC["alarm_calculator.py<br/>arrival - 40 min<br/>LIVE / SCHEDULED / FALLBACK"]
-        NOTIFY["notification_service.py<br/>format, de-duplicate, publish"]
+    subgraph SB["Supabase project (Free plan)"]
+        CRON["Supabase Cron (pg_cron)<br/>'17,23,30 22 * * 0-4' UTC<br/>= 03:47, 03:53, 04:00 IST Mon-Fri"]
+        VAULT[("Vault<br/>malabar_project_url<br/>malabar_trigger_secret")]
+        NET["pg_net<br/>HTTP POST + x-alarm-secret"]
+        FN["Edge Function: malabar-alarm<br/>handler.ts"]
+        DB[("public.alarm_runs<br/>run log + duplicate check<br/>(RLS on, service key only)")]
+        CRON --> NET
+        VAULT --> NET
+        NET --> FN
+        FN <-->|"read: already sent today?<br/>write: this run's result"| DB
     end
-    RR[("RailRadar API<br/>/v1/trains/16630/live")]
-    NTFY[("ntfy.sh<br/>private topic")]
-    PHONE["iPhone<br/>ntfy app"]
-
-    CRON --> MAIN
-    MANUAL --> MAIN
-    CFG --> MAIN
-    MAIN --> CLIENT -->|"Bearer API key"| RR
-    RR -->|JSON| CLIENT --> SVC --> CALC --> NOTIFY
-    CLIENT -. "API down / timeout" .-> CALC
-    NOTIFY -->|"1. read today's history"| NTFY
-    NOTIFY -->|"2. POST notification"| NTFY
-    NTFY -->|push| PHONE
+    MANUAL["Manual test<br/>curl + x-alarm-secret"] --> FN
+    FN -->|"Bearer RAILRADAR_API_KEY"| RR[("RailRadar API<br/>/v1/trains/16630/live")]
+    RR -->|JSON| FN
+    FN -->|"POST (priority 5)"| NTFY[("ntfy.sh<br/>private topic")]
+    NTFY -->|push| PHONE["iPhone<br/>ntfy app"]
 ```
 
 Each run does this:
 
-1. Calls `GET https://api.railradar.in/v1/trains/16630/live` with your API key. It waits up to 20 seconds and retries once on a timeout or server error.
-2. Checks the answer: `success` must be true, `data.train.number` must be `16630`, and `data.route[]` must contain a stop with `stationCode = CNGR`.
-3. Picks the arrival time at Chengannur. It uses arrival, not departure.
-4. **Wake-up = arrival − 40 minutes**, using India time (Asia/Kolkata).
-5. Reads your ntfy topic's messages from the last 12 hours. If today's notification was already sent, it stops here.
-6. Sends the notification. The run reports success only if ntfy confirms it received the message.
+1. **Checks the caller.** The request must carry the `x-alarm-secret` header, and its value must match the `ALARM_TRIGGER_SECRET` secret.
+2. **Checks the day.** It continues only on Monday to Friday, India time (IST). Manual runs (`"force": true`) skip this check.
+3. **Calls RailRadar.** It sends `GET https://api.railradar.in/v1/trains/16630/live`, waiting up to 15 seconds and retrying once on a timeout or server error.
+4. **Validates the response.** `success` must be true, `data.train.number` must be `16630`, and `data.route[]` must contain a stop with `stationCode = CNGR`.
+5. **Picks the arrival time** at Chengannur. It uses arrival, not departure.
+6. **Works out the wake-up time:** arrival − 40 minutes, in IST.
+7. **Checks for duplicates.** It looks in `alarm_runs` to see if today's notification was already sent. If it was, it records the run as `skipped` and stops.
+8. **Sends the notification.** It posts it to ntfy and records the run. The outcome is only recorded as `sent` if ntfy confirms it received the message.
 
-<a id="status-meanings"></a>
+<a id="status"></a>
 ## 2. What LIVE / SCHEDULED / FALLBACK mean
 
 | Status | When | Arrival used |
 |---|---|---|
 | **LIVE** | `actualArrival` for CNGR is present and valid | RailRadar's predicted (or actual) arrival |
 | **SCHEDULED** | API worked but `actualArrival` is empty or invalid | `scheduledArrival` (timetable) |
-| **FALLBACK** | API down, timed out, bad JSON, wrong train, CNGR missing, no times, **or the data is for a different day** | The configured timetable arrival `04:51` → wake-up **04:11** |
+| **FALLBACK** | API down, timed out, bad JSON, wrong train, CNGR missing, no times, **or the data is for a different day** | Configured timetable arrival `04:51` → wake-up **04:11** |
 
-Anything other than LIVE has the status in its title and includes a `Reason:` line. Out-of-date data is never presented as LIVE. If the API is still showing yesterday's journey, you get a FALLBACK.
+Anything other than LIVE has the status in its title and includes a `Reason:` line. Out-of-date data is never presented as LIVE.
 
-The `provenance` value that RailRadar sends, for example `predicted`, is shown exactly as received on the `Source:` line.
-
-**Duplicate protection.** Three runs are scheduled each morning so that one late or dropped run doesn't mean no notification. The first run sends the notification. Later runs see the `Ref: 16630/<date>/<STATUS>` line in your ntfy history and skip. There is one exception: if the earlier notification was SCHEDULED or FALLBACK and a later run gets a LIVE prediction, the LIVE one is sent as an update. Manual test runs are marked `/manual` so they never block the next morning's real notification.
+**Duplicate protection:** three runs are scheduled each morning so that one failed run doesn't mean no notification. The first successful run sends the notification. Later runs find a `sent` row for that date in `alarm_runs` and skip. There is one exception: an earlier SCHEDULED or FALLBACK notification is replaced by a LIVE one if a later run gets a prediction. Manual runs never block or get blocked by the scheduled ones.
 
 ---
 
-<a id="deployment-checklist"></a>
+<a id="checklist"></a>
 ## 3. Deployment checklist
 
-- [ ] Create a **private** GitHub repository ([Step 1](#step-1))
-- [ ] Push this project to it, on the default branch `main` ([Step 2](#step-2))
-- [ ] Generate a long, random ntfy topic name ([Step 3](#step-3))
-- [ ] Install **ntfy** from the App Store and subscribe to the topic ([Step 4](#step-4))
-- [ ] Allow ntfy notifications: Lock Screen, Sounds, Banners, Time Sensitive, Focus exceptions ([Step 4](#step-4))
-- [ ] Add secrets `RAILRADAR_API_KEY` and `NTFY_TOPIC` ([Step 5](#step-5))
-- [ ] Actions tab → **Tests** workflow is green
-- [ ] Actions tab → **Malabar Smart Alarm** → **Run workflow** with *Dry run* ticked, then check the log ([Step 6](#step-6))
-- [ ] Run it again without *Dry run* and confirm the iPhone notification arrives ([Step 7](#step-7))
-- [ ] Next weekday morning, check that one scheduled run sent the notification and the other runs logged `Not sending: already sent`
+- [ ] Supabase account and a new **Free** project in region **Mumbai** ([Step 1](#step-1))
+- [ ] `supabase login` and `supabase link` ([Step 2](#step-2))
+- [ ] `supabase db push` creates the table and the cron job ([Step 3](#step-3))
+- [ ] Secrets set: `RAILRADAR_API_KEY`, `NTFY_TOPIC`, `ALARM_TRIGGER_SECRET` ([Step 4](#step-4))
+- [ ] `supabase functions deploy malabar-alarm --no-verify-jwt` ([Step 5](#step-5))
+- [ ] Two Vault secrets created in the SQL editor ([Step 6](#step-6))
+- [ ] ntfy app installed, subscribed, notifications allowed, Sleep Focus exception added ([ntfy setup](#ntfy))
+- [ ] Manual dry run returns `"outcome": "dry_run"` with sensible times ([Step 7](#step-7))
+- [ ] Manual real run puts a notification on the iPhone ([Step 7](#step-7))
+- [ ] Next weekday: `alarm_runs` shows one `sent` row and two `skipped` rows
+- [ ] For the first two weeks, check the dashboard to make sure the project is not paused ([pausing](#pausing))
 
 ---
 
 <a id="step-1"></a>
-## Step 1 - Create a private GitHub repository
+## Step 1 - Create a Supabase project
 
-1. Sign in at <https://github.com> and click **+** (top right) → **New repository**.
-2. Repository name: `malabar-smart-alarm`.
-3. Select **Private**. This keeps your configuration and run logs out of public view.
-4. Do **not** tick "Add a README" (this project already has one). Click **Create repository**.
+1. Sign up at <https://supabase.com> (free, no card needed).
+2. **New project** → choose your organisation → name it `malabar-smart-alarm`.
+3. **Database password:** click *Generate a password* and save it in your password manager. The CLI asks for it once in Step 2.
+4. **Region:** *South Asia (Mumbai)*. It's closest to RailRadar and to you.
+5. Plan: **Free**. Click **Create new project** and wait about 2 minutes.
+6. Note the **Project ref**, the random ID in the project URL: `https://supabase.com/dashboard/project/<project-ref>`.
 
 <a id="step-2"></a>
-## Step 2 - Upload the project
+## Step 2 - Link this folder to the project
 
-**Option A - command line (recommended).** In Terminal:
+The Supabase CLI is installed with `brew install supabase/tap/supabase`.
 
 ```bash
 cd /path/to/malabar-smart-alarm
 ```
 
 ```bash
-git init -b main
+supabase login
 ```
 
 ```bash
-git add . && git commit -m "Initial commit: Malabar Smart Alarm"
+supabase link --project-ref <project-ref>
 ```
 
-```bash
-git remote add origin https://github.com/<your-username>/malabar-smart-alarm.git
-```
-
-```bash
-git push -u origin main
-```
-
-**Option B - web upload.** On the empty repository page, click **uploading an existing file** and drag in
-all the files and folders. Finder hides the `.github` folder, so press `Cmd + Shift + .` to show hidden
-files first, and check that `.github/workflows/malabar-alarm.yml` was uploaded.
-
-> Scheduled workflows only run from the **default branch** (normally `main`).
+`supabase login` opens a browser to approve access. `supabase link` asks for the database password from Step 1.
 
 <a id="step-3"></a>
-## Step 3 - Create your ntfy topic
-
-On the public ntfy.sh server, a topic doesn't need to be created and has no password. **Anyone who knows the topic name can read
-and post to it**, so treat the name like a password and make it long and random:
+## Step 3 - Create the database table and schedule
 
 ```bash
-python3 -c "import secrets; print('malabar-' + secrets.token_urlsafe(18))"
+supabase db push
 ```
 
-You'll get something like `malabar-Xy3k...`. Keep it private: it goes only into the ntfy app and a GitHub Secret.
-Allowed characters are letters, digits, `-` and `_`, up to 64 characters.
+This applies [`supabase/migrations/20261111180000_malabar_alarm.sql`](supabase/migrations/20261111180000_malabar_alarm.sql), which:
+
+- creates the `public.alarm_runs` table with Row Level Security on, so the public keys can't read or write it
+- turns on `pg_cron` and `pg_net`
+- schedules the `malabar-alarm` cron job and a daily clean-up job
+
+No secrets are stored in this file.
 
 <a id="step-4"></a>
-## Step 4 - Install ntfy on iPhone and allow notifications
+## Step 4 - Set the function secrets
 
-1. Install **ntfy** from the App Store (publisher: Philipp Heckel).
-2. Open it, tap **+**, paste your topic name, keep the server as `https://ntfy.sh`, and tap **Subscribe**.
-3. When iOS asks **"ntfy Would Like to Send You Notifications"**, tap **Allow**.
-4. Open iPhone **Settings → Notifications → ntfy** and turn on:
-   - **Allow Notifications**
-   - **Lock Screen**, **Notification Centre**, **Banners** (choose *Persistent* so it stays on screen)
-   - **Sounds**
-   - **Time Sensitive Notifications**, if shown
-5. If you use **Sleep Focus / Do Not Disturb**: go to **Settings → Focus → Sleep → Apps** and add **ntfy**
-   so the notification can get through overnight.
-6. Test it from your Mac. Replace the topic with yours:
+First generate a random trigger secret. It stops anyone else from calling your function:
 
+```bash
+openssl rand -hex 32
+```
+
+Then add the secrets in the **dashboard**, so they never end up in your shell history: **Edge Functions → Secrets → Add new secret**.
+
+| Name | Value | Required |
+|---|---|---|
+| `RAILRADAR_API_KEY` | Your RailRadar key: the part *after* `Bearer ` | Yes |
+| `NTFY_TOPIC` | Your ntfy topic name (just the name, not the URL) | Yes |
+| `ALARM_TRIGGER_SECRET` | The `openssl` value above. Keep it: Step 6 and manual tests need it | Yes |
+| `NTFY_TOKEN` | ntfy access token, only for protected topics or self-hosted ntfy | No |
+
+**Optional settings.** Add these as secrets too, only if you want to change a default:
+
+| Name | Default | Example |
+|---|---|---|
+| `BUFFER_MINUTES` | `40` | `30` |
+| `FALLBACK_SCHEDULED_ARRIVAL` | `04:51` (24-hour clock, IST) | `04:45` |
+| `MONITORING_DAYS` | `MON-FRI` | `MON-SAT` |
+| `TRAIN_NUMBER` / `TRAIN_NAME` | `16630` / `Malabar Express` | |
+| `BOARDING_STATION_CODE` / `BOARDING_STATION_NAME` | `CNGR` / `Chengannur` | `KTYM` / `Kottayam` |
+| `NTFY_PRIORITY` | `5` (max) | `4` |
+| `NTFY_SERVER` | `https://ntfy.sh` | your server (HTTPS only) |
+
+You don't need to set `SUPABASE_URL` or the service key. Supabase gives them to every Edge Function automatically.
+
+<a id="step-5"></a>
+## Step 5 - Deploy the Edge Function
+
+```bash
+supabase functions deploy malabar-alarm --no-verify-jwt
+```
+
+`--no-verify-jwt` (also set in `supabase/config.toml`) means Supabase doesn't require a login token to call the function. The function protects itself with `ALARM_TRIGGER_SECRET` instead. Without the right header, it replies `401 Unauthorized` and does nothing.
+
+<a id="step-6"></a>
+## Step 6 - Give the schedule its Vault secrets
+
+The cron job reads the function's address and the trigger secret from **Supabase Vault**, so neither is written in the migration. Open **SQL Editor → New query** and run this once, with your own values:
+
+```sql
+select vault.create_secret('https://<project-ref>.supabase.co', 'malabar_project_url');
+select vault.create_secret('<ALARM_TRIGGER_SECRET from Step 4>', 'malabar_trigger_secret');
+```
+
+To check them (this shows only the names, not the values):
+
+```sql
+select name, created_at from vault.secrets where name like 'malabar_%';
+```
+
+<a id="step-7"></a>
+## Step 7 - Test manually
+
+Replace `<project-ref>`. The trigger secret is read silently, so it isn't saved in your shell history.
+
+**Dry run:** works everything out and returns the message, but sends nothing:
+
+```bash
+read -rs ALARM_SECRET && curl -sS -X POST "https://<project-ref>.supabase.co/functions/v1/malabar-alarm" -H "x-alarm-secret: $ALARM_SECRET" -H "Content-Type: application/json" -d '{"force": true, "dry_run": true}'; unset ALARM_SECRET
+```
+
+**Real notification to your iPhone:**
+
+```bash
+read -rs ALARM_SECRET && curl -sS -X POST "https://<project-ref>.supabase.co/functions/v1/malabar-alarm" -H "x-alarm-secret: $ALARM_SECRET" -H "Content-Type: application/json" -d '{"force": true}'; unset ALARM_SECRET
+```
+
+Request options:
+
+| Option | Meaning |
+|---|---|
+| `"force": true` | Manual run: ignores the weekday check, always sends, adds "(Manual test run)", and never affects duplicate protection |
+| `"dry_run": true` | Don't send. Return the message instead |
+| `"skip_dedupe": true` | Scheduled-style run that sends even if one was already sent |
+
+After 12:00 noon IST, a run looks at **tomorrow morning's** arrival, which is tonight's train. Before noon it looks at today's.
+
+A successful real run returns something like:
+
+```json
+{ "outcome": "sent", "status": "LIVE", "arrival": "05:14", "wakeup": "04:34", "ntfyMessageId": "..." }
+```
+
+You can also run it from the dashboard: **Edge Functions → malabar-alarm → Test**. Add the `x-alarm-secret` header and a body.
+
+---
+
+<a id="ntfy"></a>
+## ntfy and iPhone setup
+
+1. **Choose a topic.** On ntfy.sh, anyone who knows a topic name can read and post to it. Generate a long random one:
+   ```bash
+   python3 -c "import secrets; print('malabar-' + secrets.token_urlsafe(18))"
+   ```
+2. **Install ntfy** from the App Store (publisher: Philipp Heckel). Tap **+**, paste the topic, keep the server as `https://ntfy.sh`, tap **Subscribe**, and tap **Allow** when asked about notifications.
+3. **Allow notifications.** In **Settings → Notifications → ntfy**, turn on Lock Screen, Notification Centre, Banners (*Persistent*), Sounds, and Time Sensitive.
+4. **Let it through overnight.** In **Settings → Focus → Sleep → Apps**, add **ntfy** so it can get through during Sleep Focus.
+5. **Test from your Mac:**
    ```bash
    curl -H "Title: Test" -H "Priority: 5" -d "Hello from my Mac" https://ntfy.sh/YOUR-TOPIC
    ```
 
-   The notification should appear on your phone within a few seconds.
-
-> Notifications are sent with priority 5 (max). To be safe, keep a regular Clock alarm at your
-> earliest usual time (for example the 04:11 fallback) as a backup, and adjust it when the notification arrives.
-
-<a id="step-5"></a>
-## Step 5 - Configure GitHub Actions Secrets
-
-In your repository: **Settings → Secrets and variables → Actions → Secrets tab → New repository secret**.
-
-| Name | Value | Required |
-|---|---|---|
-| `RAILRADAR_API_KEY` | Your RailRadar API key: the part *after* `Bearer `, without quotes | Yes |
-| `NTFY_TOPIC` | The topic name from Step 3 (just the name, not the URL) | Yes |
-| `NTFY_TOKEN` | An ntfy access token. Only needed if you use protected topics or a self-hosted server | No |
-
-GitHub encrypts secrets and hides them in logs as `***`. The code never prints them either.
-
-**Optional settings** go in the **Variables** tab next to Secrets. These values aren't secret. If you leave one unset, the default applies.
-
-| Variable | Default | Example |
-|---|---|---|
-| `BUFFER_MINUTES` | `40` | `30` |
-| `FALLBACK_SCHEDULED_ARRIVAL` | `04:51` (24-hour clock) | `04:45` |
-| `MONITORING_DAYS` | `MON-FRI` | `MON-SAT` |
-| `TRAIN_NUMBER` / `TRAIN_NAME` | `16630` / `Malabar Express` | |
-| `BOARDING_STATION_CODE` / `BOARDING_STATION_NAME` | `CNGR` / `Chengannur` | `KTYM` / `Kottayam` |
-| `NTFY_PRIORITY` | `5` | `4` |
-| `NTFY_SERVER` | `https://ntfy.sh` | your server (HTTPS only) |
-
-<a id="step-6"></a>
-## Step 6 - Run the workflow manually
-
-1. Open the **Actions** tab. If GitHub asks, click **I understand my workflows, go ahead and enable them**.
-2. Select **Malabar Smart Alarm** on the left → **Run workflow** (on the right).
-3. The options:
-   - **Dry run**: works out everything and prints the message in the log, but sends nothing. Good for a first test.
-   - **Send even if a notification was already sent today**: on by default for manual runs.
-4. Click the green **Run workflow** button, then open the run → **notify** job → **Check train and notify**.
-
-Manual runs skip the weekday check, so you can test on a weekend. After 12:00 noon IST, a manual run
-looks at **tomorrow morning's** arrival, which is tonight's train. Before noon it looks at today's.
-
-<a id="step-7"></a>
-## Step 7 - Verify the notification
-
-- The phone shows **Malabar Smart Alarm** with the train, the times and `Status: LIVE`. Manual runs end with `/manual`.
-- The log shows `ntfy accepted the notification (id=..., status=LIVE)`.
-- The run's **Summary** page shows a short table with the status, arrival and wake-up times.
-- If the run is **red**, the notification was **not** delivered. See [Troubleshooting](#troubleshooting).
-- A **yellow warning** means a SCHEDULED or FALLBACK notification was sent instead of a LIVE one. The reason is shown.
+> To be safe, keep a regular Clock alarm at your earliest usual time (for example the 04:11 fallback) as a backup.
 
 ---
 
 <a id="scheduling"></a>
-## Scheduling and why runs can be late
+## Scheduling, timezones and delays
 
-`.github/workflows/malabar-alarm.yml`:
+- **Timezone:** Supabase Cron (pg_cron) schedules run in **UTC (GMT)**. IST is UTC+5:30, so 03:47, 03:53 and 04:00 IST Monday to Friday are **22:17, 22:23 and 22:30 UTC the previous day, Sunday to Thursday**:
+  ```
+  '17,23,30 22 * * 0-4'
+  ```
+  `0-4` means Sun–Thu. It's not a typo: the UTC day is one day behind IST at that hour. A test checks this conversion.
+- **Double check:** the function also checks the weekday in IST, so even a wrong schedule can't send on a weekend.
+- **Delays:** pg_cron starts jobs within seconds, but pg_net sends the request in the background, and the function can take up to about a minute when RailRadar is slow (timeouts and retries). The first run is at 03:47, more than 20 minutes before the earliest fallback wake-up time (04:11).
+- **See what ran:**
+  ```sql
+  select jobname, schedule, active from cron.job;
+  select jobid, status, start_time, return_message from cron.job_run_details order by start_time desc limit 10;
+  select id, status_code, created from net._http_response order by created desc limit 10;
+  select created_at, journey_date, status, outcome, wakeup at time zone 'Asia/Kolkata' as wakeup_ist, reason
+    from public.alarm_runs order by created_at desc limit 10;
+  ```
 
-```yaml
-on:
-  schedule:
-    - cron: '47 3 * * 1-5'
-      timezone: 'Asia/Kolkata'
-    - cron: '53 3 * * 1-5'
-      timezone: 'Asia/Kolkata'
-    - cron: '0 4 * * 1-5'
-      timezone: 'Asia/Kolkata'
-```
+<a id="pausing"></a>
+## Free plan: keeping the project awake
 
-- GitHub's official docs confirm that schedules accept an IANA `timezone`. Without it, cron times are
-  **UTC**. The equivalent UTC lines are in a comment in the workflow file. IST is UTC+5:30, so 04:00 IST
-  Monday is **22:30 UTC Sunday**. That's why the UTC version uses `0-4` (Sun–Thu) instead of `1-5`.
-- **Scheduled runs are not exact.** GitHub queues them, and when it's busy, especially at the top of
-  each hour, a run can start many minutes late, and some runs are **dropped**. That's why there are three runs,
-  starting at 03:47. The program also notes in the message if the recommended wake-up time has already passed.
-- Schedules only run from the latest commit on the default branch.
-- GitHub turns off schedules after 60 days without activity **only in public repositories**. This repository is private.
-- Free-tier usage: each run takes well under a minute, and GitHub bills each job as at least 1 minute. About 3 × 22 weekdays ≈ 66 minutes a month,
-  plus test runs. GitHub Free includes 2,000 minutes a month for private repositories.
-- `concurrency` stops two alarm runs from overlapping.
+Supabase **pauses Free-plan projects after about a week of low database activity**. A paused project runs **no** cron jobs, so no notification would be sent.
+
+- Every run, including skipped ones, reads from and writes to `alarm_runs` through the API. That happens at least every 3 days (Friday to Monday is the longest gap). Supabase doesn't say officially whether this counts as activity, so **watch it for the first two weeks**.
+- Supabase emails you before pausing. If the project gets paused, open the dashboard and click **Restore**, then run the dry-run test.
+- If pausing keeps happening, the reliable fix is the Supabase **Pro** plan (paid). Or go back to the GitHub Actions version in this repository's git history (commit `0df4a05`).
+
+---
 
 <a id="changing"></a>
 ## Changing train, station, buffer and schedule
 
-- **Buffer / fallback / days / station / train:** set the matching **Variable** (Step 5). No code change is needed.
-  The defaults are in [`src/config.py`](src/config.py).
-- **Fallback time:** set `FALLBACK_SCHEDULED_ARRIVAL` to the **timetable arrival** at your station. The
-  fallback wake-up time is that minus the buffer (04:51 − 40 = 04:11).
-- **Different boarding station:** set `BOARDING_STATION_CODE`, using the code exactly as it appears in the API's `route[]`,
-  plus `BOARDING_STATION_NAME`, and update `FALLBACK_SCHEDULED_ARRIVAL`. Then do a dry run to check.
-- **Notification time:** edit the `cron` lines in `malabar-alarm.yml`. The format is `minute hour * * days`, in the
-  timezone shown. For example, `'15 3 * * 1-5'` is 03:15 Mon–Fri. Keep the runs at least 15–20 minutes
-  before your earliest possible wake-up time, and avoid minute `0` if you can. Commit and push to `main`.
-- **A train arriving in the afternoon or evening:** the program assumes the journey being checked arrives
-  on the day of the run (before noon). For other trains, adjust `monitoring_date_for` in `src/main.py`.
+- **Buffer, fallback time, days, station or train:** set the matching secret (Step 4). Changes apply from the next run. You don't need to redeploy. The defaults are in [`config.ts`](supabase/functions/malabar-alarm/config.ts).
+- **Fallback time:** set `FALLBACK_SCHEDULED_ARRIVAL` to the **timetable arrival** at your station. The wake-up time is that minus the buffer.
+- **Different boarding station:** set `BOARDING_STATION_CODE`, exactly as it appears in the API's `route[]`, plus `BOARDING_STATION_NAME` and `FALLBACK_SCHEDULED_ARRIVAL`. Then do a dry run.
+- **Run time:** convert IST to UTC (subtract 5 h 30 min; if the result is before midnight, the UTC day is the previous one). Then update the job in the SQL editor:
+  ```sql
+  select cron.alter_job(job_id := (select jobid from cron.job where jobname = 'malabar-alarm'),
+                        schedule := '45 21 * * 0-4');  -- = 03:15 IST Mon-Fri
+  ```
+  Also update the migration file so the repository matches.
+- **Pause notifications** (for example on holiday):
+  ```sql
+  select cron.alter_job(job_id := (select jobid from cron.job where jobname = 'malabar-alarm'), active := false);
+  ```
+  Use `active := true` to resume. Pausing notifications this way also stops the database activity, so the project may get paused after a week. See [pausing](#pausing).
+- **Trains arriving in the afternoon or evening:** the function assumes the journey being checked arrives on the day of the run (before noon). Adjust `journeyDateFor` in [`handler.ts`](supabase/functions/malabar-alarm/handler.ts).
+
+---
 
 <a id="troubleshooting"></a>
 ## Troubleshooting
 
-Open **Actions → the run → notify → Check train and notify** and look at the log.
+Logs are at **Dashboard → Edge Functions → malabar-alarm → Logs**. Every line starts with `[malabar]`.
 
-| Log / notification says | Meaning and fix |
+| Symptom / message | Meaning and fix |
 |---|---|
-| `RailRadar rejected the API key (HTTP 401/403)` | The key is wrong or expired. Re-copy it into `RAILRADAR_API_KEY` without `Bearer ` and without spaces. |
+| `401 Unauthorized` | `x-alarm-secret` doesn't match `ALARM_TRIGGER_SECRET`. For scheduled runs, check the `malabar_trigger_secret` Vault secret has exactly the same value. |
+| `ALARM_TRIGGER_SECRET missing` (500) | Add the secret (Step 4). |
+| `NTFY_TOPIC is missing or invalid` (500) | Add the secret. Use only letters, digits, `-` and `_`. |
+| `RailRadar rejected the API key (HTTP 401/403)` | The key is wrong or expired. Re-enter it without `Bearer `. |
 | `RailRadar has no live data for this train (HTTP 404)` | The train number is wrong, or the train isn't running today. |
 | `RailRadar returned HTTP 429` | Rate limited. Check your RailRadar plan's limits. |
-| `request timed out` / `Network error` | RailRadar was slow or unreachable. A FALLBACK was sent. The next scheduled run will try again. |
-| `invalid JSON` / `unexpected JSON structure` | The API returned an error page or changed format. Try the request with curl (below). |
-| `station CNGR not found in route` | Check the station code in the API's `route[]`. |
-| `API data is for the journey reaching CNGR on <date>` | RailRadar was still showing a different day's journey. A FALLBACK was sent on purpose. |
-| `No live prediction ... using timetable` (SCHEDULED) | The API had no `actualArrival` yet. |
-| `NTFY_TOPIC is missing or invalid` (exit code 2) | Add the secret. Use only letters, digits, `-` and `_`. |
-| `Notification NOT delivered` (red run) | ntfy rejected the message or couldn't be reached. Check ntfy.sh status and your topic/token. |
-| Run is green, but no notification on the phone | Check the phone is subscribed to the exact same topic, and check Step 4 settings and Focus. |
-| `Not sending: already sent` | Working as designed. To force a resend, run manually with the resend option ticked. |
-| No scheduled runs at all | The workflow file must be on the default branch, and Actions must be enabled (Settings → Actions → General). |
+| `timed out` / `network error` | RailRadar was slow or unreachable. A FALLBACK was sent. The next run will try again. |
+| `station CNGR not found in route` | Check the station code in the API response. |
+| `API data is for the journey reaching CNGR on <date>` | RailRadar was showing a different day's journey. A FALLBACK was sent on purpose. |
+| `Notification NOT delivered` (502) | ntfy rejected the message or couldn't be reached. Check ntfy.sh status and your topic/token. |
+| `Duplicate check unavailable` | The run log couldn't be read. It sent anyway, so a duplicate is possible. |
+| No runs at all | Check `select * from cron.job_run_details order by start_time desc limit 5;`. If there's nothing there, check that the project isn't **paused** and that `cron.job` lists `malabar-alarm`. If `net._http_response` shows errors, check the Vault secrets (Step 6). |
+| Run says `sent` but no notification | Check the phone is subscribed to the exact same topic, and check the iPhone settings and Focus ([ntfy setup](#ntfy)). |
 
-**Test the API from your Mac.** Paste the key when prompted. It's read silently and isn't saved in your shell history:
+**Test the RailRadar API directly from your Mac:**
 
 ```bash
 read -rs RR_KEY && curl -sS -H "Authorization: Bearer $RR_KEY" https://api.railradar.in/v1/trains/16630/live | python3 -m json.tool | head -60; unset RR_KEY
 ```
 
-**Dry run locally against the live API.** This prints the message and sends nothing:
-
-```bash
-read -rs RAILRADAR_API_KEY && export RAILRADAR_API_KEY && python3 -m src.main --dry-run --force; unset RAILRADAR_API_KEY
-```
+---
 
 <a id="security"></a>
 ## Security and rotating credentials
 
-- The API key and ntfy topic are kept only in **GitHub Secrets** and are never committed to the repository. `.gitignore` excludes
-  `.env` files.
-- The code never logs the `Authorization` header, the API key, the ntfy topic or the token. Error messages are
-  written by the code itself, not copied from raw responses, and `repr()` hides secrets.
-- All connections use HTTPS, and plain `http://` addresses are rejected. The workflow has only `contents: read` permission
-  and checks out code with `persist-credentials: false`.
-- Keep the repository private.
+- **No secrets in git.** The API key, ntfy topic and trigger secret are kept only in Supabase secrets and Vault. `.gitignore` excludes `.env*` files.
+- **Nothing secret is logged.** The function never logs or returns the RailRadar key, the ntfy topic, the token or the trigger secret. Error messages are written by the code itself. Tests check this.
+- **The function checks every caller.** It requires the trigger secret, compared in constant time, before doing anything. It accepts only `POST`.
+- **The run log is locked down.** `alarm_runs` has Row Level Security on with no policies, and access is revoked from `anon`/`authenticated`. Only the function, using the service key, can use it.
+- **HTTPS only.** Plain `http://` addresses are rejected.
+- **One caveat about pg_net.** It briefly stores each outgoing request, including the `x-alarm-secret` header, in `net.http_request_queue`. Supabase warns about this. The worst anyone with database access could do with that secret is trigger an extra notification.
 
-**Changing the RailRadar key:** create a new key in your RailRadar account → update the
-`RAILRADAR_API_KEY` secret (Settings → Secrets → ✏️) → run the workflow manually to test → revoke the old key.
+**Changing credentials:**
 
-**Changing the ntfy topic** (if you think someone else knows it): generate a new topic (Step 3) → update the
-`NTFY_TOPIC` secret → subscribe to the new topic in the ntfy app and delete the old subscription → test with a manual run.
+- **RailRadar key:** create a new key in RailRadar → update the `RAILRADAR_API_KEY` secret → do a dry run → revoke the old key.
+- **ntfy topic:** generate a new topic → update `NTFY_TOPIC` → subscribe in the ntfy app and delete the old subscription → do a real test.
+- **Trigger secret:** `openssl rand -hex 32` → update the `ALARM_TRIGGER_SECRET` secret **and** the Vault secret in the SQL editor:
+  ```sql
+  select vault.update_secret((select id from vault.secrets where name = 'malabar_trigger_secret'), '<new value>');
+  ```
+- **If a secret was ever committed or shared,** change it immediately.
 
-**If a secret was ever committed by mistake:** change it immediately. Removing it from the repository's history isn't enough.
+---
 
 <a id="tests"></a>
 ## Running tests locally
 
-The tests need only Python 3.9 or newer. They make no network calls and use no real keys.
+The tests need [Deno](https://deno.com) (`brew install deno`). They make no network calls and use no real keys.
 
 ```bash
-python3 -m unittest discover -s tests -t . -v
+cd supabase/functions && deno test --allow-read tests/
 ```
 
-They cover:
+The 65 tests cover:
 
 - a successful API response
 - finding Chengannur in the response
@@ -359,37 +399,38 @@ They cover:
 - network timeouts
 - building the notification
 - converting times to IST
-- weekday scheduling and the UTC-to-IST date change
+- weekday scheduling and the UTC-to-IST date change, including checking every cron firing against IST
 - out-of-date journey data
-- duplicate detection
+- duplicate protection
 - delivery failures
+- authentication
+- the run-log table
 - configuration parsing
 
-They also check the schedule in the workflow file.
-
-The sample API response used in the tests is in [`tests/fixtures/railradar_live_16630.json`](tests/fixtures/railradar_live_16630.json).
+The sample API response is [`supabase/functions/tests/fixtures/railradar_live_16630.json`](supabase/functions/tests/fixtures/railradar_live_16630.json).
 
 <a id="structure"></a>
 ## Project structure
 
 ```
 malabar-smart-alarm/
-├── .github/workflows/
-│   ├── malabar-alarm.yml       # scheduled alarm (03:47/03:53/04:00 IST, Mon-Fri) + manual run
-│   └── tests.yml               # unit tests on every push (kept separate so tests never block the alarm)
-├── src/
-│   ├── __init__.py
-│   ├── config.py               # defaults + environment overrides + validation
-│   ├── railradar_client.py     # HTTPS client: timeout, retry, error handling
-│   ├── train_service.py        # response validation, CNGR extraction, timestamp parsing
-│   ├── alarm_calculator.py     # LIVE/SCHEDULED/FALLBACK decision, wake-up maths
-│   ├── notification_service.py # ntfy message, duplicate detection, publish
-│   └── main.py                 # orchestration, exit codes, CLI flags
-├── tests/                      # unittest suite + mock API response
+├── supabase/
+│   ├── config.toml                      # Supabase CLI config (malabar-alarm: verify_jwt = false)
+│   ├── migrations/
+│   │   └── 20261111180000_malabar_alarm.sql   # alarm_runs table, RLS, pg_cron schedule
+│   └── functions/
+│       ├── malabar-alarm/
+│       │   ├── index.ts                 # Deno.serve entry point
+│       │   ├── handler.ts               # auth, orchestration, duplicate rule, HTTP responses
+│       │   ├── config.ts                # defaults + secret overrides + validation
+│       │   ├── railradar.ts             # RailRadar client: timeout, retry, errors
+│       │   ├── train.ts                 # response validation, CNGR extraction, timestamps
+│       │   ├── alarm.ts                 # LIVE/SCHEDULED/FALLBACK decision, wake-up maths
+│       │   ├── notify.ts                # ntfy message + publish
+│       │   ├── store.ts                 # alarm_runs via the REST API
+│       │   ├── time.ts                  # timezone helpers (Intl, no libraries)
+│       │   ├── http.ts / log.ts         # shared helpers
+│       └── tests/                       # Deno tests + mock API response
 ├── .gitignore
-├── requirements.txt            # empty: standard library only
 └── README.md
 ```
-
-**Exit codes:** `0` = sent or intentionally skipped; `1` = not delivered, or API key missing (a FALLBACK was still sent);
-`2` = configuration error.

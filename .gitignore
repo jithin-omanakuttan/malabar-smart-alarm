@@ -21,3 +21,7 @@ htmlcov/
 .vscode/
 .idea/
 .DS_Store
+
+# Supabase / Deno
+supabase/.temp/
+supabase/.branches/

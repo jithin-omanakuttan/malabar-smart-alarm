@@ -1,3 +1,0 @@
-# No third-party packages required.
-# Malabar Smart Alarm uses only the Python standard library (Python 3.9+):
-#   urllib (HTTPS), json, zoneinfo (timezones), logging, unittest (tests).
