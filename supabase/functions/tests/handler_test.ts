@@ -5,14 +5,15 @@ import { MemoryLogger } from "../malabar-alarm/log.ts";
 import { PostgrestStore } from "../malabar-alarm/store.ts";
 import { buildFallback } from "../malabar-alarm/alarm.ts";
 import {
-  FAKE_API_KEY, FAKE_TOPIC, FAKE_TRIGGER, FakeFetch, ist, loadFixture, MemoryStore, noSleep, PUBLISHED, settings, status,
+  FAKE_API_KEY, FAKE_EMAIL, FAKE_RESEND_KEY, FAKE_TRIGGER, FakeFetch, ist, loadFixture, MemoryStore, noSleep, SENT, settings, status,
   timeoutError, utc,
 } from "./helpers.ts";
 
 const ENV = {
   ALARM_TRIGGER_SECRET: FAKE_TRIGGER,
   RAILRADAR_API_KEY: FAKE_API_KEY,
-  NTFY_TOPIC: FAKE_TOPIC,
+  RESEND_API_KEY: FAKE_RESEND_KEY,
+  ALARM_EMAIL_TO: FAKE_EMAIL,
 };
 const THURSDAY_4AM = ist(2026, 11, 12, 4, 0);
 
@@ -20,7 +21,7 @@ function req(body: unknown = {}, secret = FAKE_TRIGGER, method = "POST"): Reques
   return new Request("https://example.supabase.co/functions/v1/malabar-alarm", {
     method,
     headers: { "x-alarm-secret": secret, "Content-Type": "application/json" },
-    body: method === "POST" ? JSON.stringify(body) : undefined,
+    body: method === "GET" ? undefined : JSON.stringify(body),
   });
 }
 
@@ -86,8 +87,8 @@ Deno.test("rejects missing or wrong trigger secret", async () => {
   assertEquals(res.status, 401);
   const noSecret = await handleRequest(req({}), { ...ENV, ALARM_TRIGGER_SECRET: "" }, { log: new MemoryLogger() });
   assertEquals(noSecret.status, 500);
-  const get = await handleRequest(req({}, FAKE_TRIGGER, "GET"), ENV, { log: new MemoryLogger() });
-  assertEquals(get.status, 405);
+  const put = await handleRequest(req({}, FAKE_TRIGGER, "PUT"), ENV, { log: new MemoryLogger() });
+  assertEquals(put.status, 405);
 });
 
 Deno.test("rejects non-JSON body", async () => {
@@ -98,28 +99,31 @@ Deno.test("rejects non-JSON body", async () => {
 // --- End to end ------------------------------------------------------------
 
 Deno.test("LIVE end to end; secrets never logged or returned", async () => {
-  const fetch = new FakeFetch({ railradar: [loadFixture()], "ntfy.sh": [PUBLISHED] });
+  const fetch = new FakeFetch({ railradar: [loadFixture()], "api.resend.com": [SENT] });
   const store = new MemoryStore();
   const { res, body, log } = await call({ fetch, store });
   assertEquals(res.status, 200);
   assertEquals(body.outcome, "sent");
   assertEquals(body.status, "LIVE");
   assertEquals(body.wakeup, "04:34");
-  const sent = fetch.callsTo("ntfy.sh")[0].body!;
-  assertStringIncludes(sent, "Predicted arrival: 05:14 AM");
-  assertStringIncludes(sent, "Recommended wake-up: 04:34 AM");
+  const sent = fetch.callsTo("api.resend.com")[0].body!;
+  const mail = JSON.parse(sent);
+  assertEquals(mail.subject, "Malabar Alarm 04:34 | LIVE | Thu 12 Nov 2026");
+  assertStringIncludes(mail.text, "Predicted arrival: 05:14 AM");
+  assertStringIncludes(mail.text, "WAKEUP=04:34");
   assertEquals(store.records.map((r) => r.outcome), ["sent"]);
-  assertEquals(store.records[0].ntfyMessageId, "m1");
+  assertEquals(store.records[0].messageId, "email-1");
+  assertEquals(body.messageId, "email-1");
   const everything = log.lines.join("\n") + JSON.stringify(body);
-  for (const secret of [FAKE_API_KEY, FAKE_TOPIC, FAKE_TRIGGER]) assertFalse(everything.includes(secret), secret);
+  for (const secret of [FAKE_API_KEY, FAKE_RESEND_KEY, FAKE_TRIGGER]) assertFalse(everything.includes(secret), secret);
 });
 
 Deno.test("API timeout sends FALLBACK", async () => {
-  const fetch = new FakeFetch({ railradar: [timeoutError(), timeoutError()], "ntfy.sh": [PUBLISHED] });
+  const fetch = new FakeFetch({ railradar: [timeoutError(), timeoutError()], "api.resend.com": [SENT] });
   const { body } = await call({ fetch });
   assertEquals(body.status, "FALLBACK");
   assertEquals(body.wakeup, "04:11");
-  assertStringIncludes(fetch.callsTo("ntfy.sh")[0].body!, "Status: FALLBACK");
+  assertStringIncludes(JSON.parse(fetch.callsTo("api.resend.com")[0].body!).subject, "04:11 | FALLBACK");
 });
 
 Deno.test("duplicate LIVE is skipped and logged", async () => {
@@ -127,25 +131,25 @@ Deno.test("duplicate LIVE is skipped and logged", async () => {
   const store = new MemoryStore(new Set(["LIVE"]));
   const { body } = await call({ fetch, store });
   assertEquals(body.outcome, "skipped");
-  assertEquals(fetch.callsTo("ntfy.sh").length, 0);
+  assertEquals(fetch.callsTo("api.resend.com").length, 0);
   assertEquals(store.records.map((r) => r.outcome), ["skipped"]);
 });
 
 Deno.test("earlier FALLBACK is upgraded to LIVE", async () => {
-  const fetch = new FakeFetch({ railradar: [loadFixture()], "ntfy.sh": [PUBLISHED] });
+  const fetch = new FakeFetch({ railradar: [loadFixture()], "api.resend.com": [SENT] });
   const { body } = await call({ fetch, store: new MemoryStore(new Set(["FALLBACK"])) });
   assertEquals(body.outcome, "sent");
 });
 
 Deno.test("run-log outage still sends (no missed alarm)", async () => {
-  const fetch = new FakeFetch({ railradar: [loadFixture()], "ntfy.sh": [PUBLISHED] });
+  const fetch = new FakeFetch({ railradar: [loadFixture()], "api.resend.com": [SENT] });
   const { body, log } = await call({ fetch, store: new MemoryStore(new Set(), true) });
   assertEquals(body.outcome, "sent");
   assert(log.lines.some((l) => l.includes("Duplicate check unavailable")));
 });
 
 Deno.test("delivery failure returns 502 and is recorded", async () => {
-  const fetch = new FakeFetch({ railradar: [loadFixture()], "ntfy.sh": [status(500), status(500), status(500)] });
+  const fetch = new FakeFetch({ railradar: [loadFixture()], "api.resend.com": [status(500), status(500), status(500)] });
   const store = new MemoryStore();
   const { res, body } = await call({ fetch, store });
   assertEquals(res.status, 502);
@@ -161,29 +165,30 @@ Deno.test("weekend: nothing happens unless forced", async () => {
   assertEquals(body.outcome, "not_monitoring_day");
   assertEquals(idle.calls.length, 0);
 
-  const fetch = new FakeFetch({ railradar: [loadFixture()], "ntfy.sh": [PUBLISHED] });
+  const fetch = new FakeFetch({ railradar: [loadFixture()], "api.resend.com": [SENT] });
   const store = new MemoryStore(new Set(["LIVE"])); // manual runs ignore duplicates
   const forced = await call({ fetch, now: saturday, store, body: { force: true } });
   assertEquals(forced.body.outcome, "sent");
   assert(store.records[0].manual);
-  assertStringIncludes(fetch.callsTo("ntfy.sh")[0].body!, "(Manual test run)");
+  assertStringIncludes(JSON.parse(fetch.callsTo("api.resend.com")[0].body!).subject, "| TEST");
 });
 
 Deno.test("dry run sends nothing and returns the message", async () => {
   const fetch = new FakeFetch({ railradar: [loadFixture()] });
-  const { body } = await call({ fetch, body: { force: true, dry_run: true }, env: { NTFY_TOPIC: "" } });
+  const { body } = await call({ fetch, body: { force: true, dry_run: true }, env: { RESEND_API_KEY: "" } });
   assertEquals(body.outcome, "dry_run");
-  assertStringIncludes(body.message.body, "Recommended wake-up: 04:34 AM");
-  assertEquals(fetch.callsTo("ntfy.sh").length, 0);
+  assertStringIncludes(body.email.text, "WAKEUP=04:34");
+  assertEquals(fetch.callsTo("api.resend.com").length, 0);
 });
 
-Deno.test("missing topic is a config error", async () => {
-  const { res } = await call({ env: { NTFY_TOPIC: "" } });
-  assertEquals(res.status, 500);
+Deno.test("missing email settings are config errors", async () => {
+  assertEquals((await call({ env: { RESEND_API_KEY: "" } })).res.status, 500);
+  assertEquals((await call({ env: { ALARM_EMAIL_TO: "" } })).res.status, 500);
+  assertEquals((await call({ env: { ALARM_EMAIL_TO: "nope" } })).res.status, 500);
 });
 
 Deno.test("missing API key sends FALLBACK with warning", async () => {
-  const fetch = new FakeFetch({ "ntfy.sh": [PUBLISHED] });
+  const fetch = new FakeFetch({ "api.resend.com": [SENT] });
   const { body } = await call({ fetch, env: { RAILRADAR_API_KEY: "" } });
   assertEquals(body.status, "FALLBACK");
   assertStringIncludes(body.warning, "RAILRADAR_API_KEY");
@@ -235,15 +240,45 @@ Deno.test("config defaults and overrides", () => {
   assertEquals(loadConfig({ BUFFER_MINUTES: "  " }).settings.bufferMinutes, 40);
 });
 
-Deno.test("config rejects invalid values without echoing topic", () => {
+Deno.test("config rejects invalid values", () => {
   for (const env of [
     { BUFFER_MINUTES: "abc" }, { BUFFER_MINUTES: "500" }, { TRAIN_NUMBER: "16x30" }, { TIMEZONE: "Mars/Base" },
-    { FALLBACK_SCHEDULED_ARRIVAL: "4.51" }, { NTFY_SERVER: "http://ntfy.sh" }, { MONITORING_DAYS: "FUNDAY" },
+    { FALLBACK_SCHEDULED_ARRIVAL: "4.51" }, { MONITORING_DAYS: "FUNDAY" }, { EMAIL_SUBJECT_PREFIX: "Wake 04:00" },
   ]) assertThrows(() => loadConfig(env), ConfigError, undefined, JSON.stringify(env));
-  try {
-    loadConfig({ NTFY_TOPIC: "secret/with/slash" });
-  } catch (e) {
-    assertFalse((e as Error).message.includes("secret/with"));
-  }
   assertThrows(() => parseWeekdays("FRI-MON"), ConfigError);
+});
+
+// --- GET: latest wake-up for the iPhone Shortcut -----------------------------
+
+async function getLatest(store: MemoryStore, query = "", secret = FAKE_TRIGGER) {
+  const r = new Request(`https://x/functions/v1/malabar-alarm${query}`, { method: "GET", headers: { "x-alarm-secret": secret } });
+  return await handleRequest(r, ENV, { log: new MemoryLogger(), store, now: () => ist(2026, 11, 12, 3, 50) });
+}
+
+Deno.test("GET returns latest emailed wake-up (JSON and text)", async () => {
+  const store = new MemoryStore();
+  store.latest = { status: "LIVE", wakeup: "2026-11-11T23:04:00Z", arrival: "2026-11-11T23:44:00Z", manual: false, createdAt: "2026-11-11T22:17:05Z" };
+  const res = await getLatest(store);
+  assertEquals(res.status, 200);
+  const body = await res.json();
+  assertEquals([body.wakeup, body.arrival, body.status, body.journeyDate], ["04:34", "05:14", "LIVE", "2026-11-12"]);
+  const text = await getLatest(store, "?format=text");
+  assertEquals(await text.text(), "04:34");
+});
+
+Deno.test("GET with nothing sent yet returns 404; wrong secret 401", async () => {
+  assertEquals((await getLatest(new MemoryStore())).status, 404);
+  const t = await getLatest(new MemoryStore(), "?format=text");
+  assertEquals([t.status, await t.text()], [404, "NONE"]);
+  assertEquals((await getLatest(new MemoryStore(), "", "wrong")).status, 401);
+});
+
+Deno.test("PostgrestStore.latestSent queries newest sent row", async () => {
+  const fetch = new FakeFetch({ "alarm_runs": [[{ status: "LIVE", wakeup: "2026-11-11T23:04:00+00:00", arrival: "2026-11-11T23:44:00+00:00", manual: true, created_at: "x" }]] });
+  const latest = await new PostgrestStore("https://abc.supabase.co", "eyJ.k", fetch.fn).latestSent("16630", "2026-11-12");
+  assertEquals(latest?.status, "LIVE");
+  assertEquals(latest?.manual, true);
+  assertStringIncludes(fetch.calls[0].url, "order=created_at.desc");
+  assertStringIncludes(fetch.calls[0].url, "limit=1");
+  assertStringIncludes(fetch.calls[0].url, "outcome=eq.sent");
 });

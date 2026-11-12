@@ -7,8 +7,6 @@
 import { isValidTimeZone } from "./time.ts";
 
 export const WEEKDAY_NAMES = ["MON", "TUE", "WED", "THU", "FRI", "SAT", "SUN"] as const;
-/** ntfy topic names: letters, digits, '_' and '-', max 64 characters. */
-export const NTFY_TOPIC_PATTERN = /^[A-Za-z0-9_-]{1,64}$/;
 
 export class ConfigError extends Error {
   override name = "ConfigError";
@@ -32,17 +30,19 @@ export interface Settings {
   apiBaseUrl: string;
   apiTimeoutMs: number;
   apiMaxAttempts: number;
-  ntfyServer: string;
-  ntfyPriority: number;
-  ntfyTimeoutMs: number;
-  ntfyMaxAttempts: number;
-  notificationTitle: string;
+  /** Sender shown in the email. onboarding@resend.dev works without a verified domain. */
+  emailFrom: string;
+  /** Subject starts with this; the iPhone automation triggers on it. */
+  emailSubjectPrefix: string;
+  emailTimeoutMs: number;
+  emailMaxAttempts: number;
 }
 
 export interface Secrets {
   railradarApiKey: string;
-  ntfyTopic: string;
-  ntfyToken: string;
+  resendApiKey: string;
+  /** Recipient. On Resend's free plan without a domain: your Resend sign-up address. */
+  emailTo: string;
 }
 
 export const DEFAULT_SETTINGS: Settings = {
@@ -60,11 +60,10 @@ export const DEFAULT_SETTINGS: Settings = {
   apiBaseUrl: "https://api.railradar.in/v1",
   apiTimeoutMs: 15_000,
   apiMaxAttempts: 2,
-  ntfyServer: "https://ntfy.sh",
-  ntfyPriority: 5,
-  ntfyTimeoutMs: 10_000,
-  ntfyMaxAttempts: 3,
-  notificationTitle: "Malabar Smart Alarm",
+  emailFrom: "Malabar Smart Alarm <onboarding@resend.dev>",
+  emailSubjectPrefix: "Malabar Alarm",
+  emailTimeoutMs: 10_000,
+  emailMaxAttempts: 3,
 };
 
 export type Env = Record<string, string | undefined>;
@@ -127,14 +126,22 @@ function requireHttps(name: string, url: string): string {
 export function loadConfig(env: Env): { settings: Settings; secrets: Secrets } {
   const s: Settings = { ...DEFAULT_SETTINGS };
 
-  const text = (name: string, key: "trainName" | "boardingStationName" | "destinationName" | "notificationTitle") => {
+  const text = (name: string, key: "trainName" | "boardingStationName" | "destinationName" | "emailFrom") => {
     const v = get(env, name);
     if (v) s[key] = v;
   };
   text("TRAIN_NAME", "trainName");
   text("BOARDING_STATION_NAME", "boardingStationName");
   text("DESTINATION_NAME", "destinationName");
-  text("NOTIFICATION_TITLE", "notificationTitle");
+  text("ALARM_EMAIL_FROM", "emailFrom");
+
+  const prefix = get(env, "EMAIL_SUBJECT_PREFIX");
+  if (prefix) {
+    if (/\d{1,2}:\d{2}/.test(prefix) || prefix.length > 60) {
+      throw new ConfigError("EMAIL_SUBJECT_PREFIX must not contain a time (HH:MM) and must be at most 60 characters");
+    }
+    s.emailSubjectPrefix = prefix;
+  }
 
   const trainNumber = get(env, "TRAIN_NUMBER");
   if (trainNumber) {
@@ -159,9 +166,6 @@ export function loadConfig(env: Env): { settings: Settings; secrets: Secrets } {
   const buffer = get(env, "BUFFER_MINUTES");
   if (buffer) s.bufferMinutes = parseIntIn("BUFFER_MINUTES", buffer, 0, 240);
 
-  const priority = get(env, "NTFY_PRIORITY");
-  if (priority) s.ntfyPriority = parseIntIn("NTFY_PRIORITY", priority, 1, 5);
-
   const days = get(env, "MONITORING_DAYS");
   if (days) s.monitoringWeekdays = parseWeekdays(days);
 
@@ -171,21 +175,12 @@ export function loadConfig(env: Env): { settings: Settings; secrets: Secrets } {
   const apiBase = get(env, "RAILRADAR_API_BASE_URL");
   if (apiBase) s.apiBaseUrl = requireHttps("RAILRADAR_API_BASE_URL", apiBase);
 
-  const ntfyServer = get(env, "NTFY_SERVER");
-  if (ntfyServer) s.ntfyServer = requireHttps("NTFY_SERVER", ntfyServer);
-
-  const topic = get(env, "NTFY_TOPIC") ?? "";
-  if (topic && !NTFY_TOPIC_PATTERN.test(topic)) {
-    // Never echo the topic: it is a secret.
-    throw new ConfigError("NTFY_TOPIC may only contain letters, digits, '_' and '-' (max 64)");
-  }
-
   return {
     settings: s,
     secrets: {
       railradarApiKey: get(env, "RAILRADAR_API_KEY") ?? "",
-      ntfyTopic: topic,
-      ntfyToken: get(env, "NTFY_TOKEN") ?? "",
+      resendApiKey: get(env, "RESEND_API_KEY") ?? "",
+      emailTo: get(env, "ALARM_EMAIL_TO") ?? "",
     },
   };
 }

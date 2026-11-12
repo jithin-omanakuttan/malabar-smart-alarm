@@ -22,13 +22,23 @@ export interface RunRecord {
   trainNumber: string;
   result: AlarmResult;
   detail: string;
-  ntfyMessageId?: string | null;
+  messageId?: string | null;
 }
 
 export interface RunStore {
   /** Statuses already successfully sent by scheduled (non-manual) runs. */
   sentStatuses(trainNumber: string, journeyDate: string): Promise<Set<string>>;
   record(run: RunRecord): Promise<void>;
+  /** Most recent successfully sent run for a journey date (manual runs included), or null. */
+  latestSent(trainNumber: string, journeyDate: string): Promise<LatestSent | null>;
+}
+
+export interface LatestSent {
+  status: string;
+  wakeup: string;
+  arrival: string;
+  manual: boolean;
+  createdAt: string;
 }
 
 export class PostgrestStore implements RunStore {
@@ -85,6 +95,34 @@ export class PostgrestStore implements RunStore {
     return new Set(rows.map((r) => String((r as Record<string, unknown>).status)));
   }
 
+  async latestSent(trainNumber: string, journeyDate: string): Promise<LatestSent | null> {
+    const params = new URLSearchParams({
+      select: "status,wakeup,arrival,manual,created_at",
+      train_number: `eq.${trainNumber}`,
+      journey_date: `eq.${journeyDate}`,
+      outcome: "eq.sent",
+      order: "created_at.desc",
+      limit: "1",
+    });
+    const response = await this.#call(`${this.#baseUrl}?${params}`, { method: "GET", headers: this.#headers() }, "latest lookup");
+    let rows: unknown;
+    try {
+      rows = await response.json();
+    } catch {
+      throw new StoreError("latest lookup returned invalid JSON");
+    }
+    if (!Array.isArray(rows)) throw new StoreError("latest lookup returned an unexpected structure");
+    if (rows.length === 0) return null;
+    const r = rows[0] as Record<string, unknown>;
+    return {
+      status: String(r.status),
+      wakeup: String(r.wakeup),
+      arrival: String(r.arrival),
+      manual: r.manual === true,
+      createdAt: String(r.created_at),
+    };
+  }
+
   async record(run: RunRecord): Promise<void> {
     const r = run.result;
     const row = {
@@ -98,7 +136,7 @@ export class PostgrestStore implements RunStore {
       delay_minutes: r.delayMinutes,
       reason: r.reason,
       detail: run.detail,
-      ntfy_message_id: run.ntfyMessageId ?? null,
+      message_id: run.messageId ?? null,
     };
     await this.#call(
       this.#baseUrl,

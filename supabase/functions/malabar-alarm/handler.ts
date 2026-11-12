@@ -1,13 +1,17 @@
 /**
- * Orchestration. `handleRequest` is the HTTP entry point (called by pg_cron
- * through pg_net, or manually with curl); `runAlarm` is the testable core.
+ * Orchestration. `handleRequest` is the HTTP entry point; `runAlarm` is the
+ * testable core.
+ *
+ *   POST  (pg_cron via pg_net, or curl)  -> check train, email the wake-up time
+ *   GET   (iPhone Shortcut backup)        -> latest emailed wake-up for today, e.g.
+ *         {"wakeup":"04:36","status":"LIVE",...}   (add ?format=text for "04:36")
  */
 
 import { type AlarmResult, buildFallback, calculateFromSnapshot } from "./alarm.ts";
 import { ConfigError, type Env, loadConfig, parseBool, type Settings } from "./config.ts";
 import type { FetchFn, SleepFn } from "./http.ts";
 import { consoleLogger, type Logger } from "./log.ts";
-import { buildMessage, NotificationError, NtfyClient, shouldSend } from "./notify.ts";
+import { buildEmail, NotificationError, ResendEmailClient, shouldSend } from "./notify.ts";
 import { RailRadarClient, RailRadarError } from "./railradar.ts";
 import { PostgrestStore, type RunStore, StoreError } from "./store.ts";
 import { addDays, formatTime24, localDate, zonedParts } from "./time.ts";
@@ -22,7 +26,7 @@ export interface RunOptions {
 
 export interface Deps {
   railradar: RailRadarClient | null;
-  ntfy: NtfyClient | null;
+  email: ResendEmailClient | null;
   store: RunStore | null;
   log: Logger;
 }
@@ -38,8 +42,8 @@ export interface RunReport {
   delayMinutes?: number | null;
   reason?: string | null;
   detail: string;
-  ntfyMessageId?: string;
-  message?: { title: string; body: string };
+  messageId?: string;
+  email?: { subject: string; text: string };
 }
 
 export function isMonitoringDay(now: Date, settings: Settings): boolean {
@@ -48,8 +52,8 @@ export function isMonitoringDay(now: Date, settings: Settings): boolean {
 
 /**
  * The journey date to check. Scheduled runs happen before dawn, so this is
- * normally today. A manual run after midday looks at tomorrow morning's
- * arrival (tonight's train) instead of returning a stale FALLBACK.
+ * normally today. A run after midday looks at tomorrow morning's arrival
+ * (tonight's train) instead of returning a stale FALLBACK.
  */
 export function journeyDateFor(now: Date, settings: Settings): string {
   const today = localDate(now, settings.timezone);
@@ -106,22 +110,22 @@ export async function runAlarm(settings: Settings, opts: RunOptions, deps: Deps)
   };
   log.info(`Result: status=${base.status} arrival=${base.arrival} wakeup=${base.wakeup} delay=${base.delayMinutes} reason=${base.reason ?? "-"}`);
 
-  const message = buildMessage(result, settings, opts.now, opts.force);
+  const email = buildEmail(result, settings, opts.now, opts.force);
   const record = async (outcome: "sent" | "skipped" | "delivery_failed" | "dry_run", detail: string, id?: string) => {
     if (!deps.store) return;
     try {
-      await deps.store.record({ outcome, manual: opts.force, trainNumber: settings.trainNumber, result, detail, ntfyMessageId: id });
+      await deps.store.record({ outcome, manual: opts.force, trainNumber: settings.trainNumber, result, detail, messageId: id });
     } catch (err) {
       log.warn(`Could not write run log: ${(err as Error).message}`);
     }
   };
 
   if (opts.dryRun) {
-    log.info("Dry run - notification NOT sent");
+    log.info("Dry run - email NOT sent");
     await record("dry_run", "dry run");
-    return { ...base, outcome: "dry_run", detail: "dry run - notification not sent", message: { title: message.title, body: message.body } };
+    return { ...base, outcome: "dry_run", detail: "dry run - email not sent", email: { subject: email.subject, text: email.text } };
   }
-  if (!deps.ntfy) throw new NotificationError("ntfy client is not configured");
+  if (!deps.email) throw new NotificationError("email client is not configured");
 
   // Manual runs never count for duplicate protection, so they always send.
   if (!opts.skipDedupe && !opts.force) {
@@ -130,7 +134,7 @@ export async function runAlarm(settings: Settings, opts: RunOptions, deps: Deps)
       try {
         already = await deps.store.sentStatuses(settings.trainNumber, journeyDate);
       } catch (err) {
-        // Better a possible duplicate than a missed alarm.
+        // Better a possible duplicate than a missed alarm (Resend's idempotency key also guards repeats).
         log.warn(`Duplicate check unavailable (${(err as Error).message}); sending anyway`);
       }
     } else {
@@ -147,16 +151,16 @@ export async function runAlarm(settings: Settings, opts: RunOptions, deps: Deps)
 
   let messageId: string;
   try {
-    messageId = await deps.ntfy.publish(message);
+    messageId = await deps.email.send(email);
   } catch (err) {
     const why = err instanceof NotificationError ? err.message : "unexpected error";
-    log.error(`Notification NOT delivered: ${why}`);
+    log.error(`Email NOT delivered: ${why}`);
     await record("delivery_failed", why);
-    return { ...base, outcome: "delivery_failed", detail: `Notification NOT delivered: ${why}` };
+    return { ...base, outcome: "delivery_failed", detail: `Email NOT delivered: ${why}` };
   }
-  log.info(`ntfy accepted the notification (id=${messageId}, status=${result.status})`);
-  await record("sent", "delivered to ntfy", messageId);
-  return { ...base, outcome: "sent", detail: "delivered to ntfy", ntfyMessageId: messageId };
+  log.info(`Email accepted by provider (id=${messageId}, status=${result.status})`);
+  await record("sent", "email accepted by provider", messageId);
+  return { ...base, outcome: "sent", detail: "email accepted by provider", messageId };
 }
 
 // ---------------------------------------------------------------------------
@@ -205,10 +209,49 @@ export interface HandlerDeps {
   store?: RunStore | null;
 }
 
+function makeStore(env: Env, hd: HandlerDeps, log: Logger): RunStore | null {
+  if (hd.store !== undefined) return hd.store;
+  try {
+    return new PostgrestStore(env.SUPABASE_URL ?? "", serviceKeyFrom(env), hd.fetchFn);
+  } catch (err) {
+    if (!(err instanceof StoreError)) throw err;
+    log.warn(`${err.message}; run log and duplicate protection disabled`);
+    return null;
+  }
+}
+
+/** GET: the latest emailed wake-up time for the current journey date. */
+async function handleLatest(req: Request, settings: Settings, store: RunStore | null, now: Date): Promise<Response> {
+  if (!store) return json(503, { error: "Run log not available" });
+  const journeyDate = journeyDateFor(now, settings);
+  let latest;
+  try {
+    latest = await store.latestSent(settings.trainNumber, journeyDate);
+  } catch (err) {
+    return json(503, { error: (err as Error).message });
+  }
+  const textFormat = new URL(req.url).searchParams.get("format") === "text";
+  if (!latest) {
+    return textFormat
+      ? new Response("NONE", { status: 404, headers: { "Content-Type": "text/plain" } })
+      : json(404, { journeyDate, error: "No wake-up time sent yet for this journey date" });
+  }
+  const wakeup = formatTime24(new Date(latest.wakeup), settings.timezone);
+  if (textFormat) return new Response(wakeup, { status: 200, headers: { "Content-Type": "text/plain" } });
+  return json(200, {
+    journeyDate,
+    wakeup,
+    arrival: formatTime24(new Date(latest.arrival), settings.timezone),
+    status: latest.status,
+    manual: latest.manual,
+    sentAt: latest.createdAt,
+  });
+}
+
 export async function handleRequest(req: Request, env: Env, hd: HandlerDeps = {}): Promise<Response> {
   const log = hd.log ?? consoleLogger;
 
-  if (req.method !== "POST") return json(405, { error: "Use POST" });
+  if (req.method !== "POST" && req.method !== "GET") return json(405, { error: "Use POST (run) or GET (latest wake-up)" });
 
   const expected = env.ALARM_TRIGGER_SECRET?.trim();
   if (!expected) {
@@ -218,6 +261,21 @@ export async function handleRequest(req: Request, env: Env, hd: HandlerDeps = {}
   if (!(await secretsMatch(req.headers.get("x-alarm-secret") ?? "", expected))) {
     return json(401, { error: "Unauthorized" });
   }
+
+  let settings: Settings;
+  let secrets;
+  try {
+    ({ settings, secrets } = loadConfig(env));
+  } catch (err) {
+    if (err instanceof ConfigError) {
+      log.error(`Configuration error: ${err.message}`);
+      return json(500, { error: `Configuration error: ${err.message}` });
+    }
+    throw err;
+  }
+  const now = hd.now ? hd.now() : new Date();
+
+  if (req.method === "GET") return handleLatest(req, settings, makeStore(env, hd, log), now);
 
   let body: Record<string, unknown> = {};
   try {
@@ -233,28 +291,15 @@ export async function handleRequest(req: Request, env: Env, hd: HandlerDeps = {}
     force: parseBool(body.force),
     skipDedupe: parseBool(body.skip_dedupe),
     dryRun: parseBool(body.dry_run),
-    now: hd.now ? hd.now() : new Date(),
+    now,
   };
 
-  let settings: Settings;
-  let secrets;
-  try {
-    ({ settings, secrets } = loadConfig(env));
-  } catch (err) {
-    if (err instanceof ConfigError) {
-      log.error(`Configuration error: ${err.message}`);
-      return json(500, { error: `Configuration error: ${err.message}` });
-    }
-    throw err;
-  }
-
-  let ntfy: NtfyClient | null = null;
+  let email: ResendEmailClient | null = null;
   if (!opts.dryRun) {
     try {
-      ntfy = new NtfyClient(settings.ntfyServer, secrets.ntfyTopic, {
-        token: secrets.ntfyToken,
-        timeoutMs: settings.ntfyTimeoutMs,
-        maxAttempts: settings.ntfyMaxAttempts,
+      email = new ResendEmailClient(secrets.resendApiKey, settings.emailFrom, secrets.emailTo, {
+        timeoutMs: settings.emailTimeoutMs,
+        maxAttempts: settings.emailMaxAttempts,
         fetchFn: hd.fetchFn,
         sleep: hd.sleep,
         log,
@@ -278,20 +323,10 @@ export async function handleRequest(req: Request, env: Env, hd: HandlerDeps = {}
     });
   } catch (err) {
     warning = (err as Error).message;
-    log.error(`${warning} - a FALLBACK notification will be sent`);
+    log.error(`${warning} - a FALLBACK email will be sent`);
   }
 
-  let store: RunStore | null = hd.store === undefined ? null : hd.store;
-  if (hd.store === undefined) {
-    try {
-      store = new PostgrestStore(env.SUPABASE_URL ?? "", serviceKeyFrom(env), hd.fetchFn);
-    } catch (err) {
-      if (!(err instanceof StoreError)) throw err;
-      log.warn(`${err.message}; run log and duplicate protection disabled`);
-    }
-  }
-
-  const report = await runAlarm(settings, opts, { railradar, ntfy, store, log });
+  const report = await runAlarm(settings, opts, { railradar, email, store: makeStore(env, hd, log), log });
   const status = report.outcome === "delivery_failed" ? 502 : 200;
   return json(status, warning ? { ...report, warning } : report);
 }

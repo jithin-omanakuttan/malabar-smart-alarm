@@ -2,12 +2,13 @@
 
 import { DEFAULT_SETTINGS, type Settings } from "../malabar-alarm/config.ts";
 import type { FetchFn } from "../malabar-alarm/http.ts";
-import type { RunRecord, RunStore } from "../malabar-alarm/store.ts";
+import type { LatestSent, RunRecord, RunStore } from "../malabar-alarm/store.ts";
 import { zonedTimeToDate } from "../malabar-alarm/time.ts";
 
 export const TZ = "Asia/Kolkata";
 export const FAKE_API_KEY = "test-key-not-real";
-export const FAKE_TOPIC = "test-topic-not-real";
+export const FAKE_RESEND_KEY = "re_test_key_not_real";
+export const FAKE_EMAIL = "me@example.com";
 export const FAKE_TRIGGER = "test-trigger-secret";
 
 const FIXTURE_TEXT = await Deno.readTextFile(new URL("./fixtures/railradar_live_16630.json", import.meta.url));
@@ -98,6 +99,10 @@ export class MemoryStore implements RunStore {
     this.records.push(run);
     return Promise.resolve();
   }
+  latest: LatestSent | null = null;
+  latestSent(): Promise<LatestSent | null> {
+    return Promise.resolve(this.latest);
+  }
 }
 
-export const PUBLISHED = { id: "m1", event: "message" };
+export const SENT = { id: "email-1" };
